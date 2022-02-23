@@ -144,6 +144,25 @@ defmodule PlausibleWeb.Api.ExternalControllerTest do
       assert pageview.pathname == "/"
     end
 
+    test "domain is pulled from URL if missing in the payload", %{conn: conn} do
+      params = %{
+        name: "pageview",
+        url: "https://external-controller-test-domain-fallback.com/"
+      }
+
+      conn =
+        conn
+        |> put_req_header("content-type", "text/plain")
+        |> post("/api/event", Jason.encode!(params))
+
+      pageview = get_event("external-controller-test-domain-fallback.com")
+
+      assert response(conn, 202) |> String.to_integer()
+      assert pageview.hostname == "external-controller-test-domain-fallback.com"
+      assert pageview.domain == "external-controller-test-domain-fallback.com"
+      assert pageview.pathname == "/"
+    end
+
     test "bots and crawlers are ignored", %{conn: conn} do
       params = %{
         name: "pageview",

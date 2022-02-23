@@ -73,6 +73,6 @@ defmodule Plausible.ClickhouseEvent do
       ],
       empty_values: [nil, ""]
     )
-    |> validate_required([:name, :domain, :hostname, :pathname, :user_id, :timestamp])
+    |> validate_required([:name, :hostname, :pathname, :user_id, :timestamp])
   end
 end
