@@ -3,14 +3,18 @@ defmodule Plausible.ClickhouseEvent do
   import Ecto.Changeset
 
   @primary_key false
-  schema "events" do
+  schema "events_v2" do
     field :name, :string
     field :domain, :string
+    field :domain_list, :any, virtual: true
     field :hostname, :string
     field :pathname, :string
     field :user_id, :integer
     field :session_id, :integer
+    field :event_id, :integer
     field :timestamp, :naive_datetime
+    field :duration, :integer, default: 0
+    field :sign, :integer
 
     field :referrer, :string, default: ""
     field :referrer_source, :string, default: ""
@@ -40,8 +44,10 @@ defmodule Plausible.ClickhouseEvent do
     |> cast(
       attrs,
       [
+        :event_id,
         :name,
         :domain,
+        :domain_list,
         :hostname,
         :pathname,
         :user_id,

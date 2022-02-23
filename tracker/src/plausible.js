@@ -1,8 +1,8 @@
 (function(){
   'use strict';
 
-  var location = window.location
-  var document = window.document
+  var location = window.location;
+  var document = window.document;
 
   {{#if compat}}
   var scriptEl = document.getElementById('plausible');
@@ -28,7 +28,6 @@
     return new URL(el.src).origin + '/api/event'
     {{/if}}
   }
-
 
   function trigger(eventName, options) {
     {{#unless local}}
@@ -57,6 +56,7 @@
     payload.u = location.href
     {{/if}}
     payload.d = scriptEl.getAttribute('data-domain')
+
     payload.r = document.referrer || null
     payload.w = window.innerWidth
     if (options && options.meta) {
@@ -77,6 +77,11 @@
 
     request.onreadystatechange = function() {
       if (request.readyState == 4) {
+        {{#if beacon}}
+        var resp = request.responseText;
+        if (resp && !isNaN(resp)) { lastEventId = resp }
+        {{/if}}
+
         options && options.callback && options.callback()
       }
     }
@@ -107,14 +112,9 @@
       }
   }
 
-  function registerOutboundLinkEvents() {
-    document.addEventListener('click', handleOutbound)
-    document.addEventListener('auxclick', handleOutbound)
-  }
-  {{/if}}
+  document.addEventListener('click', handleOutbound)
+  document.addEventListener('auxclick', handleOutbound)
 
-  {{#if outbound_links}}
-  registerOutboundLinkEvents()
   {{/if}}
 
   var queue = (window.plausible && window.plausible.q) || []
@@ -154,11 +154,25 @@
       }
     }
 
-
     if (document.visibilityState === 'prerender') {
       document.addEventListener("visibilitychange", handleVisibilityChange);
     } else {
       page()
     }
+
+    {{#if beacon}}
+    var lastEventId;
+
+    function enrich() {
+      if (/hidden|unloaded/.test(document.visibilityState) && lastEventId) {
+        navigator.sendBeacon(endpoint, JSON.stringify({n: "enrich", e: lastEventId}))
+      }
+    }
+
+    document.addEventListener("visibilitychange", enrich);
+    document.addEventListener("pagehide", enrich);
+    window.addEventListener("beforeunload", enrich);
+    {{/if}}
+
   {{/unless}}
 })();

@@ -3,11 +3,15 @@ defmodule PlausibleWeb.Api.ExternalController do
   use OpenTelemetryDecorator
   require Logger
 
+  @no_domain_error {:error, %{domain: ["can't be blank"]}}
+  @no_event_id_error {:error, %{event_id: ["can't be blank"]}}
+  @ignoring_message "Ignoring enrich event"
+
   def event(conn, _params) do
     with {:ok, params} <- parse_body(conn),
          _ <- Sentry.Context.set_extra_context(%{request: params}),
-         :ok <- create_event(conn, params) do
-      conn |> put_status(202) |> text("ok")
+         {:ok, response} <- create_event(conn, params) do
+      conn |> put_status(202) |> text(response)
     else
       {:error, :invalid_json} ->
         conn
@@ -68,23 +72,48 @@ defmodule PlausibleWeb.Api.ExternalController do
     end
   end
 
-  @no_domain_error {:error, %{domain: ["can't be blank"]}}
-
   defp create_event(conn, params) do
-    params = %{
-      "name" => params["n"] || params["name"],
-      "url" => params["u"] || params["url"],
-      "referrer" => params["r"] || params["referrer"],
-      "domain" => params["d"] || params["domain"],
-      "screen_width" => params["w"] || params["screen_width"],
-      "hash_mode" => params["h"] || params["hashMode"],
-      "meta" => parse_meta(params)
-    }
+    case params["n"] || params["name"] do
+      "enrich" ->
+        event_id = params["e"] || params["event_id"]
 
+        if event_id do
+          event_id = String.to_integer(event_id)
+          timestamp = params["timestamp"] || default_timestamp()
+
+          case Plausible.Event.Store.on_enrich_event(event_id, timestamp) do
+            {:ok, enriched_event} ->
+              Plausible.Session.Store.on_enrich_event(enriched_event, timestamp)
+              {:ok, "ok"}
+
+            :error ->
+              {:ok, @ignoring_message}
+          end
+        else
+          @no_event_id_error
+        end
+
+      _other ->
+        params = %{
+          "name" => params["n"] || params["name"],
+          "url" => params["u"] || params["url"],
+          "referrer" => params["r"] || params["referrer"],
+          "domain" => params["d"] || params["domain"],
+          "screen_width" => params["w"] || params["screen_width"],
+          "hash_mode" => params["h"] || params["hashMode"],
+          "meta" => parse_meta(params),
+          "timestamp" => params["timestamp"] || default_timestamp()
+        }
+
+        handle_event(conn, params)
+    end
+  end
+
+  def handle_event(conn, params) do
     ua = parse_user_agent(conn)
 
     if is_bot?(ua) || params["domain"] in Application.get_env(:plausible, :domain_blacklist) do
-      :ok
+      {:ok, "ok"}
     else
       uri = params["url"] && URI.parse(params["url"])
       host = if uri && uri.host == "", do: "(none)", else: uri && uri.host
@@ -92,10 +121,12 @@ defmodule PlausibleWeb.Api.ExternalController do
 
       ref = parse_referrer(uri, params["referrer"])
       location_details = visitor_location_details(conn)
-      salts = Plausible.Session.Salts.fetch()
 
       event_attrs = %{
-        timestamp: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second),
+        event_id: generate_event_id(),
+        domain: params["domain"],
+        domain_list: get_domains(params, uri),
+        timestamp: Map.get(params, "timestamp", default_timestamp()),
         name: params["name"],
         hostname: strip_www(host),
         pathname: get_pathname(uri, params["hash_mode"]),
@@ -120,32 +151,40 @@ defmodule PlausibleWeb.Api.ExternalController do
         "meta.value": Map.values(params["meta"]) |> Enum.map(&Kernel.to_string/1)
       }
 
-      Enum.reduce_while(get_domains(params, uri), @no_domain_error, fn domain, _res ->
-        user_id = generate_user_id(conn, domain, event_attrs[:hostname], salts[:current])
+      if event_attrs[:domain_list] != [] do
+        store_event(conn, event_attrs)
+      else
+        @no_domain_error
+      end
+    end
+  end
 
-        previous_user_id =
-          salts[:previous] &&
-            generate_user_id(conn, domain, event_attrs[:hostname], salts[:previous])
+  defp store_event(conn, event_attrs) do
+    salts = Plausible.Session.Salts.fetch()
+    user_id = generate_user_id(conn, event_attrs[:hostname], salts[:current])
 
-        changeset =
-          event_attrs
-          |> Map.merge(%{domain: domain, user_id: user_id})
-          |> Plausible.ClickhouseEvent.new()
+    previous_user_id =
+      salts[:previous] &&
+        generate_user_id(conn, event_attrs[:hostname], salts[:previous])
 
-        if changeset.valid? do
-          event = Ecto.Changeset.apply_changes(changeset)
-          session_id = Plausible.Session.Store.on_event(event, previous_user_id)
+    changeset =
+      event_attrs
+      |> Map.merge(%{user_id: user_id})
+      |> Plausible.ClickhouseEvent.new()
 
-          event
-          |> Map.put(:session_id, session_id)
-          |> Plausible.Event.WriteBuffer.insert()
+    if changeset.valid? do
+      event = Ecto.Changeset.apply_changes(changeset)
+      {session_id, last_event_id} = Plausible.Session.Store.on_event(event, previous_user_id)
 
-          {:cont, :ok}
-        else
-          errors = Ecto.Changeset.traverse_errors(changeset, &encode_error/1)
-          {:halt, {:error, errors}}
-        end
-      end)
+      response =
+        event
+        |> Map.put(:session_id, session_id)
+        |> Plausible.Event.Store.on_event(last_event_id)
+
+      {:ok, response}
+    else
+      errors = Ecto.Changeset.traverse_errors(changeset, &encode_error/1)
+      {:error, errors}
     end
   end
 
@@ -197,7 +236,7 @@ defmodule PlausibleWeb.Api.ExternalController do
 
   defp decode_raw_props(_), do: :bad_format
 
-  defp get_domains(params, uri) do
+  def get_domains(params, uri) do
     if params["domain"] do
       String.split(params["domain"], ",")
       |> Enum.map(&String.trim/1)
@@ -465,14 +504,12 @@ defmodule PlausibleWeb.Api.ExternalController do
     end
   end
 
-  defp generate_user_id(conn, domain, hostname, salt) do
+  defp generate_user_id(conn, hostname, salt) do
     user_agent = List.first(Plug.Conn.get_req_header(conn, "user-agent")) || ""
     ip_address = PlausibleWeb.RemoteIp.get(conn)
     root_domain = get_root_domain(hostname)
 
-    if domain && root_domain do
-      SipHash.hash!(salt, user_agent <> ip_address <> domain <> root_domain)
-    end
+    Plausible.Hash.hash(salt, user_agent <> ip_address <> root_domain)
   end
 
   defp get_root_domain(nil), do: "(none)"
@@ -614,5 +651,11 @@ defmodule PlausibleWeb.Api.ExternalController do
     rescue
       _ -> nil
     end
+  end
+
+  defp generate_event_id(), do: :crypto.strong_rand_bytes(8) |> :binary.decode_unsigned()
+
+  defp default_timestamp() do
+    NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
   end
 end

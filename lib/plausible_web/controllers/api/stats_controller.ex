@@ -503,19 +503,17 @@ defmodule PlausibleWeb.Api.StatsController do
     total_visits_query =
       Query.put_filter(query, "event:page", {:member, pages})
       |> Query.put_filter("event:goal", nil)
-      |> Query.put_filter("event:name", {:is, "pageview"})
       |> Query.put_filter("visit:goal", query.filters["event:goal"])
       |> Query.put_filter("visit:page", query.filters["event:page"])
 
-    total_pageviews =
-      Stats.breakdown(site, total_visits_query, "event:page", ["pageviews"], {limit, 1})
+    total_events = Stats.breakdown(site, total_visits_query, "event:page", ["events"], {limit, 1})
 
     exit_pages =
       Enum.map(exit_pages, fn exit_page ->
         exit_rate =
-          case Enum.find(total_pageviews, &(&1["page"] == exit_page["name"])) do
-            %{"pageviews" => pageviews} ->
-              Float.floor(exit_page["total_exits"] / pageviews * 100)
+          case Enum.find(total_events, &(&1["page"] == exit_page["name"])) do
+            %{"events" => events} ->
+              Float.floor(exit_page["total_exits"] / events * 100)
 
             nil ->
               nil
@@ -552,7 +550,7 @@ defmodule PlausibleWeb.Api.StatsController do
       countries =
         countries
         |> Enum.map(fn country ->
-          country_info = get_country(country["code"])
+          country_info = Location.get_country(country["code"])
           Map.put(country, "name", country_info.name)
         end)
 
@@ -566,7 +564,7 @@ defmodule PlausibleWeb.Api.StatsController do
     else
       countries =
         Enum.map(countries, fn row ->
-          country = get_country(row["code"])
+          country = Location.get_country(row["code"])
 
           Map.merge(row, %{
             "name" => country.name,
@@ -590,14 +588,8 @@ defmodule PlausibleWeb.Api.StatsController do
       |> transform_keys(%{"region" => "code"})
       |> Enum.map(fn region ->
         region_entry = Location.get_subdivision(region["code"])
-
-        if region_entry do
-          country_entry = get_country(region_entry.country_code)
-          Map.merge(region, %{"name" => region_entry.name, "country_flag" => country_entry.flag})
-        else
-          Sentry.capture_message("Could not find region info", extra: %{code: region["code"]})
-          Map.merge(region, %{"name" => region["code"]})
-        end
+        country_entry = Location.get_country(region_entry.country_code)
+        Map.merge(region, %{"name" => region_entry.name, "country_flag" => country_entry.flag})
       end)
 
     if params["csv"] do
@@ -625,15 +617,13 @@ defmodule PlausibleWeb.Api.StatsController do
         city_info = Location.get_city(city["code"])
 
         if city_info do
-          country_info = get_country(city_info.country_code)
+          country_info = Location.get_country(city_info.country_code)
 
           Map.merge(city, %{
             "name" => city_info.name,
             "country_flag" => country_info.flag
           })
         else
-          Sentry.capture_message("Could not find city info", extra: %{code: city["code"]})
-
           Map.merge(city, %{"name" => "N/A"})
         end
       end)
@@ -954,22 +944,5 @@ defmodule PlausibleWeb.Api.StatsController do
     |> (fn res -> [headers | res] end).()
     |> CSV.encode()
     |> Enum.join()
-  end
-
-  defp get_country(code) do
-    case Location.get_country(code) do
-      nil ->
-        Sentry.capture_message("Could not find country info", extra: %{code: code})
-
-        %Location.Country{
-          alpha_2: code,
-          alpha_3: "N/A",
-          name: code,
-          flag: nil
-        }
-
-      country ->
-        country
-    end
   end
 end

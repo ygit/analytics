@@ -1,6 +1,7 @@
 defmodule Plausible.Session.Store do
   use GenServer
   use Plausible.Repo
+  import Plausible.Hash
   require Logger
 
   @garbage_collect_interval_milliseconds 60 * 1000
@@ -20,6 +21,10 @@ defmodule Plausible.Session.Store do
     GenServer.call(pid, {:on_event, event, prev_user_id})
   end
 
+  def on_enrich_event(enriched_event, timestamp, pid \\ __MODULE__) do
+    GenServer.call(pid, {:on_enrich_event, enriched_event, timestamp})
+  end
+
   def handle_call(
         {:on_event, event, prev_user_id},
         _from,
@@ -33,25 +38,65 @@ defmodule Plausible.Session.Store do
     active = is_active?(found_session, event)
 
     updated_sessions =
-      cond do
-        found_session && active ->
+      if found_session && active do
+        if is_correct_order?(found_session, event) do
           new_session = update_session(found_session, event)
-          buffer.insert([%{new_session | sign: 1}, %{found_session | sign: -1}])
+          update_clickhouse_session(buffer, found_session, new_session, event.domain_list)
           Map.put(sessions, session_key, new_session)
-
-        found_session && !active ->
-          new_session = new_session_from_event(event)
-          buffer.insert([new_session])
-          Map.put(sessions, session_key, new_session)
-
-        true ->
-          new_session = new_session_from_event(event)
-          buffer.insert([new_session])
-          Map.put(sessions, session_key, new_session)
+        else
+          sessions
+        end
+      else
+        new_session = new_session_from_event(event)
+        new_clickhouse_session(buffer, new_session, event.domain_list)
+        Map.put(sessions, session_key, new_session)
       end
 
+    last_event_id = if found_session && active, do: found_session.last_event_id, else: nil
     session_id = updated_sessions[session_key].session_id
-    {:reply, session_id, %{state | sessions: updated_sessions}}
+    {:reply, {session_id, last_event_id}, %{state | sessions: updated_sessions}}
+  end
+
+  def handle_call(
+        {:on_enrich_event, enriched_event, timestamp},
+        _from,
+        %{sessions: sessions, buffer: buffer} = state
+      ) do
+    session_key = {enriched_event.domain, enriched_event.user_id}
+
+    found_session = sessions[session_key]
+
+    updated_sessions =
+      if found_session && is_active?(found_session, enriched_event) do
+        new_session = %{
+          found_session
+          | duration: Timex.diff(timestamp, found_session.start, :second) |> abs,
+            exit_page: enriched_event.pathname
+        }
+
+        update_clickhouse_session(buffer, found_session, new_session, enriched_event.domain_list)
+        Map.put(sessions, session_key, new_session)
+      else
+        sessions
+      end
+
+    {:reply, nil, %{state | sessions: updated_sessions}}
+  end
+
+  defp update_clickhouse_session(buffer, found_session, new_session, domain_list) do
+    Enum.each(domain_list, fn domain ->
+      state_row = unique_session_for(new_session, domain)
+      cancel_row = unique_session_for(found_session, domain)
+      buffer.insert([%{state_row | sign: 1}, %{cancel_row | sign: -1}])
+    end)
+  end
+
+  defp new_clickhouse_session(buffer, new_session, domain_list) do
+    Enum.each(domain_list, fn domain ->
+      %{unique_session_for(new_session, domain) | sign: 1}
+      |> List.wrap()
+      |> buffer.insert()
+    end)
   end
 
   def reconcile_event(sessions, event) do
@@ -59,36 +104,37 @@ defmodule Plausible.Session.Store do
     found_session = sessions[session_key]
     active = is_active?(found_session, event)
 
+    last_event_id = if found_session && active, do: found_session.last_event_id, else: nil
+
     updated_sessions =
-      cond do
-        found_session && active ->
-          new_session = update_session(found_session, event)
-          Map.put(sessions, session_key, new_session)
-
-        found_session && !active ->
-          new_session = new_session_from_event(event)
-          Map.put(sessions, session_key, new_session)
-
-        true ->
-          new_session = new_session_from_event(event)
-          Map.put(sessions, session_key, new_session)
+      if found_session && active do
+        new_session = update_session(found_session, event)
+        Map.put(sessions, session_key, new_session)
+      else
+        new_session = new_session_from_event(event)
+        Map.put(sessions, session_key, new_session)
       end
 
-    updated_sessions
+    {updated_sessions, last_event_id}
   end
 
   defp is_active?(session, event) do
     session && Timex.diff(event.timestamp, session.timestamp, :second) < session_length_seconds()
   end
 
+  defp is_correct_order?(session, event) do
+    session && Timex.diff(event.timestamp, session.timestamp, :second) > 0
+  end
+
   defp update_session(session, event) do
     %{
       session
       | user_id: event.user_id,
+        last_event_id: event.event_id,
         timestamp: event.timestamp,
         exit_page: event.pathname,
         is_bounce: false,
-        duration: Timex.diff(event.timestamp, session.start, :second) |> abs,
+        duration: Timex.diff(event.timestamp, session.start, :second),
         pageviews:
           if(event.name == "pageview", do: session.pageviews + 1, else: session.pageviews),
         country_code:
@@ -134,6 +180,7 @@ defmodule Plausible.Session.Store do
     %Plausible.ClickhouseSession{
       sign: 1,
       session_id: Plausible.ClickhouseSession.random_uint64(),
+      last_event_id: event.event_id,
       hostname: event.hostname,
       domain: event.domain,
       user_id: event.user_id,
@@ -191,6 +238,15 @@ defmodule Plausible.Session.Store do
     end)
 
     {:noreply, %{state | sessions: new_sessions, timer: new_timer}}
+  end
+
+  defp unique_session_for(session, domain) do
+    %{
+      session
+      | user_id: hash(to_string(session.user_id) <> domain),
+        session_id: hash(to_string(session.session_id) <> domain),
+        domain: domain
+    }
   end
 
   defp session_length_seconds(), do: Application.get_env(:plausible, :session_length_minutes) * 60
